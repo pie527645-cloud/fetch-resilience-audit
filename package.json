@@ -1,0 +1,48 @@
+{
+  "name": "@pie527645-cloud/fetch-resilience-audit",
+  "version": "1.0.0",
+  "description": "Static AST resilience auditor for Node.js fetch() and Undici request() response body leaks, loop-shared timeout signals, and unbounded fan-out.",
+  "license": "MIT",
+  "author": "pie527645-cloud <pie527645-cloud@users.noreply.github.com>",
+  "type": "module",
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "fetch-resilience-audit": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "lint": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json && node scripts/normalize-cli.mjs",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/fra001-fetch-body.test.js dist-test/test/fra002-undici-body.test.js dist-test/test/fra003-loop-signal.test.js dist-test/test/fra004-fanout.test.js dist-test/test/golden-and-formatters.test.js dist-test/test/path-guard.test.js dist-test/test/cli.test.js"
+  },
+  "keywords": [
+    "fetch",
+    "undici",
+    "resilience",
+    "static-analysis",
+    "socket-leak",
+    "sarif",
+    "typescript",
+    "cli"
+  ],
+  "dependencies": {
+    "typescript": "^5.6.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.19"
+  }
+}
