@@ -110,4 +110,80 @@ describe('FRA001 - Unconsumed fetch() response body', () => {
     assert.equal(auditSource(leaking, 'leaky.ts').length, 1);
     assert.equal(auditSource(clean, 'clean.ts').length, 0);
   });
+
+  it('stays clean when finally cancels fetch body under !res.bodyUsed or other guards across all exits', () => {
+    const exactGuardedFinally = `
+      export async function fetchJsonSafe(u: string): Promise<unknown> {
+        const res = await fetch(u);
+        try { if (!res.ok) throw new Error('x'); return await res.json(); }
+        finally { if (!res.bodyUsed) await res.body?.cancel(); }
+      }
+    `;
+    assert.deepEqual(auditSource(exactGuardedFinally, 'guarded-finally.ts'), []);
+
+    const allExitsAndGuards = `
+      export async function guardedBodyPresence(u: string): Promise<string | null> {
+        const res = await fetch(u);
+        try {
+          if (res.status === 204) return null;
+          if (!res.ok) throw new Error('bad');
+          return await res.text();
+        } catch {
+          return null;
+        } finally {
+          if (res?.body) await res.body.cancel();
+        }
+      }
+
+      export async function loopAndAsyncIterFinally(urls: string[]): Promise<number> {
+        let total = 0;
+        for (const u of urls) {
+          const res = await fetch(u);
+          try {
+            if (res.status === 503) continue;
+            if (res.status === 404) break;
+            total += Number(res.headers.get('content-length') ?? 0);
+          } finally {
+            if (res.body && !res.bodyUsed) {
+              for await (const chunk of res.body) {
+                void chunk;
+              }
+            }
+          }
+        }
+        return total;
+      }
+
+      export async function nestedTryFinallyInsideCatch(u: string): Promise<unknown> {
+        try {
+          const res = await fetch(u);
+          try {
+            if (!res.ok) throw new Error('upstream');
+            return await res.json();
+          } finally {
+            if (!res.bodyUsed) await res.body?.cancel();
+          }
+        } catch {
+          return null;
+        }
+      }
+    `;
+    assert.deepEqual(auditSource(allExitsAndGuards, 'all-exits-finally.ts'), []);
+
+    const uninvokedCallbackInFinally = `
+      export async function uninvokedFinallyLeak(u: string): Promise<unknown> {
+        const res = await fetch(u);
+        try {
+          if (!res.ok) throw new Error('x');
+          return await res.json();
+        } finally {
+          const deferred = () => res.body?.cancel();
+          void deferred;
+        }
+      }
+    `;
+    const leakFindings = auditSource(uninvokedCallbackInFinally, 'uninvoked-finally.ts');
+    assert.equal(leakFindings.length, 1);
+    assert.equal(leakFindings[0]?.ruleId, 'FRA001');
+  });
 });

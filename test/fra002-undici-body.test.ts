@@ -61,4 +61,63 @@ describe('FRA002 - Unconsumed Undici request() response body', () => {
     assert.equal(auditSource(leakyCode, 'agent-leak.ts').length, 1);
     assert.equal(auditSource(cleanCode, 'agent-clean.ts').length, 0);
   });
+
+  it('stays clean on both unguarded finally { await body.dump(); } and guarded finally { if (!done) await body.dump(); } across all exits', () => {
+    const unguardedFinally = `
+      import { request } from 'undici';
+      export async function fetchWithUnguardedFinally(url: string): Promise<unknown> {
+        const { statusCode, body } = await request(url);
+        try {
+          if (statusCode === 204) return null;
+          if (statusCode !== 200) throw new Error('Failed');
+          return await body.json();
+        } finally {
+          await body.dump();
+        }
+      }
+    `;
+    assert.deepEqual(auditSource(unguardedFinally, 'undici-unguarded-finally.ts'), []);
+
+    const guardedFinallyAllExits = `
+      import { request } from 'undici';
+      export async function fetchWithGuardedFinally(url: string): Promise<unknown> {
+        const { statusCode, body } = await request(url);
+        let done = false;
+        try {
+          if (statusCode === 204) return null;
+          if (statusCode !== 200) throw new Error('Failed');
+          const data = await body.json();
+          done = true;
+          return data;
+        } catch {
+          return null;
+        } finally {
+          if (!done) await body.dump();
+        }
+      }
+
+      export async function retryLoopWithTryCatchDump(urls: string[]): Promise<number> {
+        let okCount = 0;
+        for (const u of urls) {
+          const { statusCode, body } = await request(u);
+          let done = false;
+          try {
+            if (statusCode === 503) continue;
+            if (statusCode === 410) break;
+            if (statusCode === 200) {
+              await body.text();
+              done = true;
+              okCount++;
+            }
+          } finally {
+            if (!done) {
+              try { await body.dump(); } catch {}
+            }
+          }
+        }
+        return okCount;
+      }
+    `;
+    assert.deepEqual(auditSource(guardedFinallyAllExits, 'undici-guarded-finally.ts'), []);
+  });
 });

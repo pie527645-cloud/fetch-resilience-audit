@@ -319,6 +319,36 @@ function mergeManyStates(states: readonly PathState[]): PathState {
   return acc;
 }
 
+function isImmediatelyInvokedFunction(fn: ts.Node): boolean {
+  let cur: ts.Node = fn;
+  while (
+    cur.parent &&
+    (ts.isParenthesizedExpression(cur.parent) ||
+      ts.isAsExpression(cur.parent) ||
+      ts.isSatisfiesExpression(cur.parent) ||
+      ts.isTypeAssertionExpression(cur.parent) ||
+      ts.isNonNullExpression(cur.parent))
+  ) {
+    cur = cur.parent;
+  }
+  return Boolean(
+    cur.parent &&
+      ts.isCallExpression(cur.parent) &&
+      unwrapExpression(cur.parent.expression) === fn
+  );
+}
+
+function nodeContains(outer: ts.Node, target: ts.Node): boolean {
+  let cur: ts.Node | undefined = target;
+  while (cur) {
+    if (cur === outer) {
+      return true;
+    }
+    cur = cur.parent;
+  }
+  return false;
+}
+
 function registerAliasesInDeclaration(decl: ts.VariableDeclaration, alloc: ResponseAllocation): void {
   if (!decl.initializer) {
     return;
@@ -345,6 +375,34 @@ function registerAliasesInDeclaration(decl: ts.VariableDeclaration, alloc: Respo
   }
 }
 
+function registerAliasesInAssignment(expr: ts.BinaryExpression, alloc: ResponseAllocation): void {
+  if (expr.operatorToken.kind !== ts.SyntaxKind.EqualsToken) {
+    return;
+  }
+  const lhs = unwrapExpression(expr.left);
+  const rhs = unwrapExpression(expr.right);
+  if (isResponseIdent(rhs, alloc)) {
+    if (ts.isIdentifier(lhs)) {
+      alloc.responseNames.add(lhs.text);
+    } else if (ts.isObjectLiteralExpression(lhs)) {
+      for (const prop of lhs.properties) {
+        if (ts.isShorthandPropertyAssignment(prop) && prop.name.text === 'body') {
+          alloc.bodyNames.add(prop.name.text);
+        } else if (
+          ts.isPropertyAssignment(prop) &&
+          ts.isIdentifier(prop.name) &&
+          prop.name.text === 'body' &&
+          ts.isIdentifier(prop.initializer)
+        ) {
+          alloc.bodyNames.add(prop.initializer.text);
+        }
+      }
+    }
+  } else if (isBodyExpr(rhs, alloc) && ts.isIdentifier(lhs)) {
+    alloc.bodyNames.add(lhs.text);
+  }
+}
+
 function simulateAllocationInScope(
   statements: readonly ts.Statement[],
   alloc: ResponseAllocation,
@@ -363,20 +421,91 @@ function simulateAllocationInScope(
   }
 
   function doesFinallyConsume(finallyBlock: ts.Block): boolean {
-    const savedLeak = firstLeak;
-    const dummyEnv: SimEnv = {
-      finallyProtected: true,
-      activeCatchThrows: null,
-      enclosingLoopCreatedDepth: -1,
-      currentLoopDepth: 0
+    if (nodeContains(finallyBlock, alloc.creationNode)) {
+      return false;
+    }
+
+    const localAlloc: ResponseAllocation = {
+      ...alloc,
+      responseNames: new Set(alloc.responseNames),
+      bodyNames: new Set(alloc.bodyNames)
     };
-    const out = simBlock(
-      finallyBlock.statements,
-      { reachable: true, created: true, mayBeUnconsumed: true },
-      dummyEnv
-    );
-    firstLeak = savedLeak;
-    return !out.mayBeUnconsumed;
+
+    function collectLocalAliases(node: ts.Node): void {
+      if (ts.isFunctionLike(node) && !isImmediatelyInvokedFunction(node)) {
+        return;
+      }
+      if (ts.isVariableDeclaration(node)) {
+        registerAliasesInDeclaration(node, localAlloc);
+      } else if (ts.isBinaryExpression(node)) {
+        registerAliasesInAssignment(node, localAlloc);
+      }
+      ts.forEachChild(node, collectLocalAliases);
+    }
+
+    const tryRoot =
+      finallyBlock.parent && ts.isTryStatement(finallyBlock.parent)
+        ? finallyBlock.parent
+        : finallyBlock;
+    collectLocalAliases(tryRoot);
+
+    let consumed = false;
+
+    function visitFinally(node: ts.Node): void {
+      if (consumed) {
+        return;
+      }
+      if (ts.isFunctionLike(node) && !isImmediatelyInvokedFunction(node)) {
+        return;
+      }
+
+      if (ts.isCallExpression(node)) {
+        const callee = unwrapExpression(node.expression);
+        if (ts.isPropertyAccessExpression(callee)) {
+          const methodName = callee.name.text;
+          if (isResponseIdent(callee.expression, localAlloc) && RESPONSE_CONSUME_METHODS.has(methodName)) {
+            consumed = true;
+            return;
+          }
+          if (isBodyExpr(callee.expression, localAlloc) && BODY_CONSUME_METHODS.has(methodName)) {
+            consumed = true;
+            return;
+          }
+        }
+        if (!isConsoleCall(node)) {
+          for (const arg of node.arguments) {
+            const uArg = unwrapExpression(arg);
+            if (isResponseIdent(uArg, localAlloc) || isBodyExpr(uArg, localAlloc)) {
+              consumed = true;
+              return;
+            }
+          }
+        }
+      } else if (ts.isNewExpression(node) && node.arguments) {
+        for (const arg of node.arguments) {
+          const uArg = unwrapExpression(arg);
+          if (isResponseIdent(uArg, localAlloc) || isBodyExpr(uArg, localAlloc)) {
+            consumed = true;
+            return;
+          }
+        }
+      } else if (ts.isForOfStatement(node)) {
+        if (isBodyExpr(node.expression, localAlloc) || isResponseIdent(node.expression, localAlloc)) {
+          consumed = true;
+          return;
+        }
+      } else if (ts.isReturnStatement(node) && node.expression) {
+        if (expressionReturnsOwnership(node.expression, localAlloc)) {
+          consumed = true;
+          return;
+        }
+      }
+
+      ts.forEachChild(node, visitFinally);
+    }
+
+    ts.forEachChild(finallyBlock, visitFinally);
+    return consumed;
   }
 
   function evalExprInFlow(expr: ts.Expression, state: PathState, env: SimEnv): PathState {
@@ -404,6 +533,19 @@ function simulateAllocationInScope(
     }
 
     scanCreation(expr);
+
+    if (next.created) {
+      function scanAliases(node: ts.Node): void {
+        if (ts.isFunctionLike(node) && !isImmediatelyInvokedFunction(node)) {
+          return;
+        }
+        if (ts.isBinaryExpression(node)) {
+          registerAliasesInAssignment(node, alloc);
+        }
+        ts.forEachChild(node, scanAliases);
+      }
+      scanAliases(expr);
+    }
 
     if (next.created && next.mayBeUnconsumed && expressionConsumes(expr, alloc)) {
       next = { ...next, mayBeUnconsumed: false };
@@ -495,6 +637,7 @@ function simulateAllocationInScope(
     if (ts.isTryStatement(stmt)) {
       const hasFinallyConsume = stmt.finallyBlock ? doesFinallyConsume(stmt.finallyBlock) : false;
       const tryProtected = env.finallyProtected || hasFinallyConsume;
+      const escapingThrows: PathState[] | null = env.activeCatchThrows !== null ? [] : null;
 
       if (stmt.catchClause) {
         const caughtThrows: PathState[] = [];
@@ -504,6 +647,9 @@ function simulateAllocationInScope(
           activeCatchThrows: caughtThrows
         };
         const afterTry = simBlock(stmt.tryBlock.statements, state, tryEnv);
+        if (tryEnv.enclosingLoopCreatedDepth > 0 && env.enclosingLoopCreatedDepth === -1) {
+          env.enclosingLoopCreatedDepth = tryEnv.enclosingLoopCreatedDepth;
+        }
 
         const catchEntry =
           caughtThrows.length > 0
@@ -511,15 +657,34 @@ function simulateAllocationInScope(
             : { reachable: true, created: false, mayBeUnconsumed: false };
         const catchEnv: SimEnv = {
           ...env,
-          finallyProtected: tryProtected
+          finallyProtected: tryProtected,
+          activeCatchThrows: escapingThrows
         };
         const afterCatch = simBlock(stmt.catchClause.block.statements, catchEntry, catchEnv);
+        if (catchEnv.enclosingLoopCreatedDepth > 0 && env.enclosingLoopCreatedDepth === -1) {
+          env.enclosingLoopCreatedDepth = catchEnv.enclosingLoopCreatedDepth;
+        }
         let merged = mergeStates(afterTry, afterCatch);
 
         if (stmt.finallyBlock) {
-          merged = simBlock(stmt.finallyBlock.statements, merged, env);
+          const finallyEnv: SimEnv = {
+            ...env,
+            finallyProtected: tryProtected,
+            activeCatchThrows: escapingThrows
+          };
+          merged = simBlock(stmt.finallyBlock.statements, merged, finallyEnv);
+          if (finallyEnv.enclosingLoopCreatedDepth > 0 && env.enclosingLoopCreatedDepth === -1) {
+            env.enclosingLoopCreatedDepth = finallyEnv.enclosingLoopCreatedDepth;
+          }
           if (hasFinallyConsume && merged.reachable) {
             merged = { ...merged, mayBeUnconsumed: false };
+          }
+        }
+        if (escapingThrows !== null && env.activeCatchThrows !== null) {
+          for (const thrown of escapingThrows) {
+            env.activeCatchThrows.push(
+              hasFinallyConsume ? { ...thrown, mayBeUnconsumed: false } : thrown
+            );
           }
         }
         return merged;
@@ -527,13 +692,32 @@ function simulateAllocationInScope(
 
       const tryEnv: SimEnv = {
         ...env,
-        finallyProtected: tryProtected
+        finallyProtected: tryProtected,
+        activeCatchThrows: escapingThrows
       };
       let afterTry = simBlock(stmt.tryBlock.statements, state, tryEnv);
+      if (tryEnv.enclosingLoopCreatedDepth > 0 && env.enclosingLoopCreatedDepth === -1) {
+        env.enclosingLoopCreatedDepth = tryEnv.enclosingLoopCreatedDepth;
+      }
       if (stmt.finallyBlock) {
-        afterTry = simBlock(stmt.finallyBlock.statements, afterTry, env);
+        const finallyEnv: SimEnv = {
+          ...env,
+          finallyProtected: tryProtected,
+          activeCatchThrows: escapingThrows
+        };
+        afterTry = simBlock(stmt.finallyBlock.statements, afterTry, finallyEnv);
+        if (finallyEnv.enclosingLoopCreatedDepth > 0 && env.enclosingLoopCreatedDepth === -1) {
+          env.enclosingLoopCreatedDepth = finallyEnv.enclosingLoopCreatedDepth;
+        }
         if (hasFinallyConsume && afterTry.reachable) {
           afterTry = { ...afterTry, mayBeUnconsumed: false };
+        }
+      }
+      if (escapingThrows !== null && env.activeCatchThrows !== null) {
+        for (const thrown of escapingThrows) {
+          env.activeCatchThrows.push(
+            hasFinallyConsume ? { ...thrown, mayBeUnconsumed: false } : thrown
+          );
         }
       }
       return afterTry;

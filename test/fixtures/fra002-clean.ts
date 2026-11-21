@@ -46,3 +46,30 @@ export async function cleanClientHelper(client: Client): Promise<string> {
   const { body } = await client.request({ path: '/stream', method: 'GET' });
   return await handleBodyStream(body);
 }
+
+export async function cleanFinallyUnguardedDump(url: string): Promise<unknown> {
+  const { statusCode, body } = await request(url);
+  try {
+    if (statusCode !== 200) {
+      throw new Error(`HTTP ${statusCode}`);
+    }
+    return await body.json();
+  } finally {
+    await body.dump();
+  }
+}
+
+export async function cleanFinallyGuardedDump(url: string): Promise<unknown> {
+  const { statusCode, body } = await request(url);
+  let done = false;
+  try {
+    if (statusCode !== 200) {
+      throw new Error(`HTTP ${statusCode}`);
+    }
+    const parsed = await body.json();
+    done = true;
+    return parsed;
+  } finally {
+    if (!done) await body.dump();
+  }
+}

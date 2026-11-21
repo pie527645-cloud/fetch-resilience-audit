@@ -30,6 +30,12 @@ export async function cleanTryFinally(url: string): Promise<unknown> {
   }
 }
 
+export async function cleanGuardedBodyUsedTryFinally(u: string): Promise<unknown> {
+  const res = await fetch(u);
+  try { if (!res.ok) throw new Error('x'); return await res.json(); }
+  finally { if (!res.bodyUsed) await res.body?.cancel(); }
+}
+
 export async function cleanHelperPass(url: string): Promise<string> {
   const res = await fetch(url);
   return await consumeHelper(res);
